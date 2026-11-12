@@ -102,3 +102,33 @@ func TestCopyRejectsEscapingNames(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "{}", string(got))
 }
+
+func TestHostPtyWriter(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		chunks []string
+		want   string
+	}{
+		{"empty", []string{"\x04"}, ""},
+		{"unterminated", []string{"tail\x04"}, "tail\n"},
+		{"split unterminated", []string{"tail", "\x04"}, "tail\n"},
+		{"terminated", []string{"line\n\x04"}, "line\n"},
+		{"split terminated", []string{"line\n", "\x04"}, "line\n"},
+		{"completed dirty line", []string{"line", "\n\x04"}, "line\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var output bytes.Buffer
+			writer := ptyWriter{Out: &output}
+			writer.AutoStop.Store(true)
+			for i, chunk := range tc.chunks {
+				_, err := writer.Write([]byte(chunk))
+				if i == len(tc.chunks)-1 {
+					assert.ErrorIs(t, err, io.EOF)
+				} else {
+					assert.NoError(t, err)
+				}
+			}
+			assert.Equal(t, tc.want, output.String())
+		})
+	}
+}

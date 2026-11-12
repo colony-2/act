@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-git/go-billy/v5/helper/polyfill"
@@ -196,17 +197,17 @@ func (e *HostEnvironment) Start(_ bool) common.Executor {
 
 type ptyWriter struct {
 	Out       io.Writer
-	AutoStop  bool
+	AutoStop  atomic.Bool
 	dirtyLine bool
 }
 
 func (w *ptyWriter) Write(buf []byte) (int, error) {
-	if w.AutoStop && len(buf) > 0 && buf[len(buf)-1] == 4 {
+	if w.AutoStop.Load() && len(buf) > 0 && buf[len(buf)-1] == 4 {
 		n, err := w.Out.Write(buf[:len(buf)-1])
 		if err != nil {
 			return n, err
 		}
-		if w.dirtyLine || len(buf) > 1 && buf[len(buf)-2] != '\n' {
+		if len(buf) == 1 && w.dirtyLine || len(buf) > 1 && buf[len(buf)-2] != '\n' {
 			_, _ = w.Out.Write([]byte("\n"))
 			return n, io.EOF
 		}
@@ -264,21 +265,46 @@ func setupPty(cmd *exec.Cmd, cmdline string) (*os.File, *os.File, error) {
 	return ppty, tty, nil
 }
 
-func writeKeepAlive(ppty io.Writer) {
-	c := 1
-	var err error
-	for c == 1 && err == nil {
-		c, err = ppty.Write([]byte{4})
-		<-time.After(time.Second)
+func writeKeepAlive(ctx context.Context, ppty io.Writer) {
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if n, err := ppty.Write([]byte{4}); n != 1 || err != nil {
+				return
+			}
+			timer.Reset(time.Second)
+		}
 	}
 }
 
-func copyPtyOutput(writer io.Writer, ppty io.Reader, finishLog context.CancelFunc) {
-	defer func() {
-		finishLog()
-	}()
-	if _, err := io.Copy(writer, ppty); err != nil {
-		return
+// Operations are local to one execution so fault tests cannot affect other jobs.
+type hostExecOperations struct {
+	setupPty     func(*exec.Cmd, string) (*os.File, *os.File, error)
+	configurePty func(*os.File) error
+	writeEOT     func(*os.File) error
+	copyOutput   func(io.Writer, io.Reader) error
+	keepAlive    func(context.Context, io.Writer)
+	cleanupGroup func(*os.Process)
+}
+
+func defaultHostExecOperations() hostExecOperations {
+	return hostExecOperations{
+		setupPty:     setupPty,
+		configurePty: configureHostPty,
+		writeEOT: func(tty *os.File) error {
+			_, err := tty.Write([]byte{4})
+			return err
+		},
+		copyOutput: func(dst io.Writer, src io.Reader) error {
+			_, err := io.Copy(dst, src)
+			return err
+		},
+		keepAlive:    writeKeepAlive,
+		cleanupGroup: cleanupHostProcessGroup,
 	}
 }
 
@@ -297,6 +323,10 @@ func getEnvListFromMap(env map[string]string) []string {
 }
 
 func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline string, env map[string]string, _, workdir string) error {
+	return e.execWithOperations(ctx, command, cmdline, env, workdir, defaultHostExecOperations())
+}
+
+func (e *HostEnvironment) execWithOperations(ctx context.Context, command []string, cmdline string, env map[string]string, workdir string, ops hostExecOperations) error {
 	envList := getEnvListFromMap(env)
 	var wd string
 	if workdir != "" {
@@ -321,48 +351,102 @@ func (e *HostEnvironment) exec(ctx context.Context, command []string, cmdline st
 	cmd.Stderr = e.StdOut
 	cmd.Dir = wd
 	cmd.SysProcAttr = getSysProcAttr(cmdline, false)
-	var ppty *os.File
-	var tty *os.File
-	defer func() {
-		if ppty != nil {
-			ppty.Close()
+	ppty, tty, ptyErr := ops.setupPty(cmd, cmdline)
+	if ptyErr != nil {
+		common.Logger(ctx).Debugf("Failed to setup Pty %v\n", ptyErr)
+	}
+	if ppty != nil {
+		defer ppty.Close()
+		defer tty.Close()
+		// Do this before starting any I/O. Later master Fd calls can undo it.
+		if err := ops.configurePty(ppty); err != nil {
+			return fmt.Errorf("configure host PTY: %w", err)
 		}
-		if tty != nil {
-			tty.Close()
-		}
-	}()
-	if true /* allocate Terminal */ {
+	} else {
+		// Own the pipe copier: exec.Cmd.Wait otherwise waits for descendants
+		// holding stdout open before we can retire their process group.
 		var err error
-		ppty, tty, err = setupPty(cmd, cmdline)
+		ppty, tty, err = os.Pipe()
 		if err != nil {
-			common.Logger(ctx).Debugf("Failed to setup Pty %v\n", err.Error())
+			return err
 		}
+		defer ppty.Close()
+		defer tty.Close()
+		cmd.Stdout, cmd.Stderr = tty, tty
 	}
 	writer := &ptyWriter{Out: e.StdOut}
-	logctx, finishLog := context.WithCancel(context.Background())
-	if ppty != nil {
-		go copyPtyOutput(writer, ppty, finishLog)
-	} else {
-		finishLog()
+	var output io.Writer = writer
+	if ptyErr != nil {
+		output = e.StdOut
 	}
-	if ppty != nil {
-		go writeKeepAlive(ppty)
-	}
-	err = cmd.Run()
-	if err != nil {
-		return err
-	}
-	if tty != nil {
-		writer.AutoStop = true
-		if _, err := tty.Write([]byte("\x04")); err != nil {
-			common.Logger(ctx).Debug("Failed to write EOT")
+	var outputErr error
+	outputDone := make(chan struct{})
+	go func() {
+		defer close(outputDone)
+		// PTY output uses io.EOF as its EOT stop marker; retain that handling.
+		copyErr := ops.copyOutput(output, ppty)
+		if ptyErr != nil {
+			outputErr = copyErr
+			// Release a producer whose output sink failed, even while cmd.Run
+			// is still waiting. Leaving this end open can fill the pipe forever.
+			_ = ppty.Close()
 		}
+	}()
+	keepCtx, stopKeepAlive := context.WithCancel(context.Background())
+	defer stopKeepAlive()
+	keepDone := make(chan struct{})
+	if ptyErr == nil {
+		go func() {
+			defer close(keepDone)
+			ops.keepAlive(keepCtx, ppty)
+		}()
+	} else {
+		close(keepDone)
 	}
-	<-logctx.Done()
 
-	if ppty != nil {
-		ppty.Close()
-		ppty = nil
+	err = cmd.Run()
+	// One budget covers EOT, output drain and helper shutdown together.
+	deadline := time.Now().Add(5 * time.Second)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	ops.cleanupGroup(cmd.Process)
+	stopKeepAlive()
+	writer.AutoStop.Store(true)
+	_ = ppty.SetWriteDeadline(deadline)
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		if ptyErr == nil {
+			// exec.Cmd uses the slave's Fd at startup, restoring blocking mode.
+			// Reconfigure it only after Wait, before the potentially blocked EOT.
+			if configureErr := ops.configurePty(tty); configureErr == nil {
+				_ = tty.SetWriteDeadline(deadline)
+				if eotErr := ops.writeEOT(tty); eotErr != nil {
+					common.Logger(ctx).Debug("Failed to write EOT")
+				}
+			}
+		} else {
+			_ = tty.Close()
+		}
+		<-outputDone
+		<-keepDone
+	}()
+	timedOut := false
+	select {
+	case <-drainDone:
+		timedOut = !time.Now().Before(deadline)
+	case <-timer.C:
+		timedOut = true
+		// Interrupt pollable I/O, then join every helper before returning.
+		_ = ppty.Close()
+		_ = tty.Close()
+		<-drainDone
+	}
+	if timedOut && err == nil {
+		err = errors.New("host executor PTY drain timed out")
+	}
+	if err == nil {
+		err = outputErr
 	}
 	return err
 }
