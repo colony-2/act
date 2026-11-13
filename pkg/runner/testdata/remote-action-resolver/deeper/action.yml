@@ -1,0 +1,6 @@
+name: Deeper composite
+runs:
+  using: composite
+  steps:
+    - id: leaf
+      uses: example/action/sub@v1

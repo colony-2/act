@@ -1,0 +1,2 @@
+packages:
+  - nix:github:NixOS/nixpkgs/be147c05f4a91a83e254e9ce5d7f0421f99fca5c#go_1_26

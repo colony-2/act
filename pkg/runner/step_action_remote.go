@@ -31,22 +31,65 @@ type stepActionRemote struct {
 	remoteAction        *remoteAction
 	cacheDir            string
 	resolvedSha         string
+	resolutionAttempted bool
+	resolutionError     error
 }
 
 var (
 	stepActionRemoteNewCloneExecutor = git.NewGitCloneExecutor
 )
 
+// Resolution has a separate lifetime from loading action content: checkout can
+// skip loading entirely, and a failed resolution must never retry or fall back.
+func (sar *stepActionRemote) resolveAction(ctx context.Context) (err error) {
+	if sar.resolutionAttempted {
+		return sar.resolutionError
+	}
+	sar.resolutionAttempted = true
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("resolve remote action %q: %w", sar.Step.Uses, err)
+		}
+		sar.resolutionError = err
+	}()
+	authored := newRemoteAction(sar.Step.Uses)
+	if authored == nil {
+		return fmt.Errorf("Expected format {org}/{repo}[/path]@ref. Actual '%s' Input string was not in a correct format", sar.Step.Uses)
+	}
+	resolver := sar.RunContext.Config.ResolveRemoteAction
+	if resolver == nil {
+		sar.remoteAction = authored
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	selector, err := resolver(ctx, sar.Step.Uses)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	effective := newRemoteAction(selector)
+	if effective == nil {
+		return fmt.Errorf("resolver returned invalid remote selector %q", selector)
+	}
+	if effective.Org != authored.Org || effective.Repo != authored.Repo || effective.Path != authored.Path {
+		return fmt.Errorf("resolver may change only the ref: %q", selector)
+	}
+	sar.remoteAction = effective
+	return nil
+}
+
 func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 	return func(ctx context.Context) error {
+		if err := sar.resolveAction(ctx); err != nil {
+			return err
+		}
 		if sar.remoteAction != nil && sar.action != nil {
 			// we are already good to run
 			return nil
-		}
-
-		sar.remoteAction = newRemoteAction(sar.Step.Uses)
-		if sar.remoteAction == nil {
-			return fmt.Errorf("Expected format {org}/{repo}[/path]@ref. Actual '%s' Input string was not in a correct format", sar.Step.Uses)
 		}
 
 		github := sar.getGithubContext(ctx)
@@ -62,6 +105,10 @@ func (sar *stepActionRemote) prepareActionExecutor() common.Executor {
 				sar.remoteAction.URL = "https://github.com"
 				github.Token = sar.RunContext.Config.ReplaceGheActionTokenWithGithubCom
 			}
+		}
+		if sar.RunContext.Config.ResolveRemoteAction != nil && ctx.Err() != nil {
+			sar.resolutionError = fmt.Errorf("resolve remote action %q: %w", sar.Step.Uses, ctx.Err())
+			return sar.resolutionError
 		}
 		if sar.RunContext.Config.ActionCache != nil {
 			cache := sar.RunContext.Config.ActionCache

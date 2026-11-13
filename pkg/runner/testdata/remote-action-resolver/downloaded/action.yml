@@ -1,0 +1,6 @@
+name: Downloaded composite
+runs:
+  using: composite
+  steps:
+    - id: deeper
+      uses: example/deeper@v1

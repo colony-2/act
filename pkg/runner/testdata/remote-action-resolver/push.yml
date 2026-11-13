@@ -1,0 +1,13 @@
+name: Original selectors
+on: push
+jobs:
+  job:
+    runs-on: fixture
+    steps:
+      - id: top
+        name: Original top-level label
+        uses: example/action/sub@v1
+      - id: local
+        uses: ./local
+      - id: downloaded
+        uses: example/composite@v1

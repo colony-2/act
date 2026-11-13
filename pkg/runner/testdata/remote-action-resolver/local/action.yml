@@ -1,0 +1,6 @@
+name: Local composite
+runs:
+  using: composite
+  steps:
+    - id: child
+      uses: example/action/sub@v1

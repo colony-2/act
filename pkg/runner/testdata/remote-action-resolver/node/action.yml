@@ -1,0 +1,8 @@
+name: Node with stages
+runs:
+  using: node20
+  pre: pre.js
+  pre-if: always()
+  main: main.js
+  post: post.js
+  post-if: always()

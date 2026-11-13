@@ -1,0 +1,7 @@
+name: Reusable action resolution
+on: workflow_call
+jobs:
+  job:
+    runs-on: fixture
+    steps:
+      - uses: example/empty@v1

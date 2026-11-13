@@ -19,6 +19,15 @@ type Runner interface {
 	NewPlanExecutor(plan *model.Plan) common.Executor
 }
 
+// RemoteActionResolver resolves an exact authored owner/repository[/subpath]@ref
+// before checkout skipping or transport. Only the ref may change; returning the
+// input is identity resolution, while an empty result is an error. Authored
+// models remain unchanged. Each remote step remembers one result or error across
+// its stages. Separate jobs may call the resolver concurrently, so callers must
+// provide a concurrency-safe resolver whose policy stays stable for the run.
+// Calls establish resolution, not fetching or execution.
+type RemoteActionResolver func(ctx context.Context, authoredSelector string) (effectiveSelector string, err error)
+
 // Config contains the config for a new runner
 type Config struct {
 	Actor                              string                       // the user that triggered the event
@@ -65,6 +74,11 @@ type Config struct {
 	ContainerNetworkMode               docker_container.NetworkMode // the network mode of job containers (the value of --network)
 	ActionCache                        ActionCache                  // Use a custom ActionCache Implementation
 	ConcurrentJobs                     int                          // Number of max concurrent jobs
+	// ResolveRemoteAction optionally resolves each remote action before checkout
+	// skipping or transport. Only its ref may change. Calls from separate jobs may
+	// overlap; the resolver must be concurrency safe and stable for a run. Nil
+	// preserves existing behavior. See RemoteActionResolver for the contract.
+	ResolveRemoteAction RemoteActionResolver `json:"-"`
 }
 
 func (config *Config) GetConcurrentJobs() int {
